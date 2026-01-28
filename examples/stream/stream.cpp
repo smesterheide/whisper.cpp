@@ -13,6 +13,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstring>
+
+// Enhanced feature: UDP socket support (POSIX only)
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <unistd.h>
 
 // command-line parameters
 struct whisper_params {
@@ -41,9 +49,89 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+
+    // Enhanced features
+    int32_t vad_startup_ms     = 0;      // initial VAD check duration before loading model (0 = disabled)
+    int32_t silence_timeout_ms = 180000; // continual silence timeout (0 = disabled)
+    int32_t udp_port           = 0;      // UDP port for network output (0 = disabled)
+    std::string udp_host       = "";     // UDP target host
 };
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
+
+// Enhanced feature: Format segment as SRT for UDP transmission
+// Uses to_timestamp() from common-whisper.h
+// Format matches output_srt() from cli.cpp
+static std::string format_segment_srt(int segment_id, int64_t t0, int64_t t1, const std::string & text) {
+    std::string srt;
+    srt += std::to_string(segment_id + 1) + "\n";
+    srt += to_timestamp(t0, true) + " --> " + to_timestamp(t1, true) + "\n";
+    srt += text + "\n\n";
+    return srt;
+}
+
+// Enhanced feature: UDP socket helper functions
+struct udp_socket {
+    int sockfd = -1;
+    struct sockaddr_in server_addr;
+    bool initialized = false;
+
+    bool init(const std::string & host, int port) {
+        if (port <= 0 || host.empty()) {
+            return false;
+        }
+
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) {
+            fprintf(stderr, "%s: failed to create UDP socket\n", __func__);
+            return false;
+        }
+
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port);
+
+        // Try to resolve hostname
+        struct hostent *he = gethostbyname(host.c_str());
+        if (he == nullptr) {
+            // Try as IP address
+            if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
+                fprintf(stderr, "%s: failed to resolve host '%s'\n", __func__, host.c_str());
+                close(sockfd);
+                sockfd = -1;
+                return false;
+            }
+        } else {
+            memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
+        }
+
+        initialized = true;
+        fprintf(stderr, "%s: UDP socket initialized for %s:%d\n", __func__, host.c_str(), port);
+        return true;
+    }
+
+    bool send(const std::string & data) {
+        if (!initialized || sockfd < 0) {
+            return false;
+        }
+
+        ssize_t sent = sendto(sockfd, data.c_str(), data.length(), 0,
+                              (struct sockaddr*)&server_addr, sizeof(server_addr));
+        return sent >= 0;
+    }
+
+    void cleanup() {
+        if (sockfd >= 0) {
+            close(sockfd);
+            sockfd = -1;
+        }
+        initialized = false;
+    }
+
+    ~udp_socket() {
+        cleanup();
+    }
+};
 
 static bool whisper_params_parse(int argc, char ** argv, whisper_params & params) {
     for (int i = 1; i < argc; i++) {
@@ -75,6 +163,11 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
+        // Enhanced features
+        else if (arg == "-vsu"  || arg == "--vad-startup")   { params.vad_startup_ms    = std::stoi(argv[++i]); }
+        else if (arg == "-sto"  || arg == "--silence-timeout") { params.silence_timeout_ms = std::stoi(argv[++i]); }
+        else if (arg == "-up"   || arg == "--udp-port")      { params.udp_port          = std::stoi(argv[++i]); }
+        else if (arg == "-uh"   || arg == "--udp-host")      { params.udp_host          = argv[++i]; }
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -115,6 +208,12 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -fa,      --flash-attn    [%-7s] enable flash attention during inference\n",        params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -nfa,     --no-flash-attn [%-7s] disable flash attention during inference\n",       params.flash_attn ? "false" : "true");
     fprintf(stderr, "\n");
+    fprintf(stderr, "Enhanced features:\n");
+    fprintf(stderr, "  -vsu N,   --vad-startup N [%-7d] initial VAD check duration in ms (0 = disabled)\n", params.vad_startup_ms);
+    fprintf(stderr, "  -sto N,   --silence-timeout N [%-7d] continual silence timeout in ms (0 = disabled)\n", params.silence_timeout_ms);
+    fprintf(stderr, "  -up N,    --udp-port N    [%-7d] UDP port for network output (0 = disabled)\n",      params.udp_port);
+    fprintf(stderr, "  -uh HOST, --udp-host HOST [%-7s] UDP target host\n",                                params.udp_host.c_str());
+    fprintf(stderr, "\n");
 }
 
 int main(int argc, char ** argv) {
@@ -152,6 +251,46 @@ int main(int argc, char ** argv) {
 
     audio.resume();
 
+    // Enhanced feature: initial VAD activation check
+    // Check for voice activity before loading the Whisper model to save resources
+    if (params.vad_startup_ms > 0) {
+        fprintf(stderr, "\n%s: performing initial VAD check for %d ms...\n", __func__, params.vad_startup_ms);
+
+        bool voice_detected = false;
+        const int vad_check_interval_ms = 2000; // check every 2 seconds
+        const int n_samples_vad_check = (1e-3 * vad_check_interval_ms) * WHISPER_SAMPLE_RATE;
+        std::vector<float> pcmf32_vad_check(n_samples_vad_check);
+
+        int elapsed_ms = 0;
+        while (elapsed_ms < params.vad_startup_ms) {
+            // Wait for audio buffer to fill with new samples
+            std::this_thread::sleep_for(std::chrono::milliseconds(vad_check_interval_ms));
+
+            // Get audio samples for VAD check
+            audio.get(vad_check_interval_ms, pcmf32_vad_check);
+
+            // Check for voice activity (vad_simple returns true when silent)
+            if (!::vad_simple(pcmf32_vad_check, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
+                voice_detected = true;
+                fprintf(stderr, "%s: voice activity detected at %d ms\n", __func__, elapsed_ms + vad_check_interval_ms);
+                break;
+            }
+
+            elapsed_ms += vad_check_interval_ms;
+            fprintf(stderr, "%s: no voice activity at %d ms...\n", __func__, elapsed_ms);
+        }
+
+        if (!voice_detected) {
+            fprintf(stderr, "%s: no voice activity detected during initial %d ms, exiting...\n", __func__, params.vad_startup_ms);
+            audio.pause();
+            return 0;
+        }
+
+        fprintf(stderr, "%s: voice detected, loading Whisper model...\n", __func__);
+        // Clear any accumulated audio before starting transcription
+        audio.clear();
+    }
+
     // whisper init
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
@@ -175,6 +314,14 @@ int main(int argc, char ** argv) {
     std::vector<float> pcmf32_new(n_samples_30s, 0.0f);
 
     std::vector<whisper_token> prompt_tokens;
+
+    // Enhanced feature: UDP socket initialization
+    udp_socket udp;
+    if (params.udp_port > 0 && !params.udp_host.empty()) {
+        if (!udp.init(params.udp_host, params.udp_port)) {
+            fprintf(stderr, "%s: warning: failed to initialize UDP socket, continuing without UDP output\n", __func__);
+        }
+    }
 
     // print some info about the processing
     {
@@ -236,6 +383,8 @@ int main(int argc, char ** argv) {
     auto t_last  = std::chrono::high_resolution_clock::now();
     const auto t_start = t_last;
 
+    int n_silent_steps = 0; // Enhanced feature: track consecutive silent steps for timeout
+
     // main audio loop
     while (is_running) {
         if (params.save_audio) {
@@ -243,6 +392,12 @@ int main(int argc, char ** argv) {
         }
         // handle Ctrl + C
         is_running = sdl_poll_events();
+
+        // Enhanced feature: check for continual silence timeout
+        if (params.silence_timeout_ms > 0 && n_silent_steps * params.step_ms >= params.silence_timeout_ms) {
+            fprintf(stderr, "\n%s: continual silence for %d ms, exiting...\n", __func__, n_silent_steps * params.step_ms);
+            is_running = false;
+        }
 
         if (!is_running) {
             break;
@@ -273,6 +428,19 @@ int main(int argc, char ** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
+            // Enhanced feature: track silence for timeout detection
+            // vad_simple returns true when audio is silent
+            if (params.silence_timeout_ms > 0) {
+                if (::vad_simple(pcmf32_new, WHISPER_SAMPLE_RATE, 1000, params.vad_thold, params.freq_thold, false)) {
+                    n_silent_steps++;
+                } else {
+                    n_silent_steps = 0;
+                }
+            }
+
+            const auto t_now  = std::chrono::high_resolution_clock::now();
+            const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last).count();
+
             const int n_samples_new = pcmf32_new.size();
 
             // take up to params.length_ms audio from previous iteration
@@ -289,6 +457,8 @@ int main(int argc, char ** argv) {
             memcpy(pcmf32.data() + n_samples_take, pcmf32_new.data(), n_samples_new*sizeof(float));
 
             pcmf32_old = pcmf32;
+
+            t_last = t_now;
         } else {
             const auto t_now  = std::chrono::high_resolution_clock::now();
             const auto t_diff = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - t_last).count();
@@ -404,6 +574,22 @@ int main(int argc, char ** argv) {
             }
 
             ++n_iter;
+
+            // Enhanced feature: send segment via UDP (sliding window mode: step > 0, use_vad = false)
+            if (!use_vad && udp.initialized) {
+                const int n_segments = whisper_full_n_segments(ctx);
+                for (int i = 0; i < n_segments; ++i) {
+                    const char * text = whisper_full_get_segment_text(ctx, i);
+
+                    const int64_t t1 = (t_last - t_start).count()/1000000;
+                    const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+
+                    std::string srt = format_segment_srt((int) n_iter / n_new_line, t0/10, t1/10, text);
+                    if (!udp.send(srt)) {
+                        fprintf(stderr, "%s: warning: failed to send UDP packet\n", __func__);
+                    }
+                }
+            }
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
                 printf("\n");
