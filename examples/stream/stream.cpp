@@ -539,6 +539,17 @@ int main(int argc, char ** argv) {
                         printf("%s", text);
                         fflush(stdout);
 
+                        // Enhanced feature: send segment via UDP
+                        if (udp.initialized) {
+                            const int64_t t1 = (t_last - t_start).count()/1000000;
+                            const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
+
+                            std::string srt = format_segment_srt(n_iter / n_new_line, t0/10, t1/10, text);
+                            if (!udp.send(srt)) {
+                                fprintf(stderr, "%s: warning: failed to send UDP packet\n", __func__);
+                            }
+                        }
+
                         if (params.fname_out.length() > 0) {
                             fout << text;
                         }
@@ -574,22 +585,6 @@ int main(int argc, char ** argv) {
             }
 
             ++n_iter;
-
-            // Enhanced feature: send segment via UDP (sliding window mode: step > 0, use_vad = false)
-            if (!use_vad && udp.initialized) {
-                const int n_segments = whisper_full_n_segments(ctx);
-                for (int i = 0; i < n_segments; ++i) {
-                    const char * text = whisper_full_get_segment_text(ctx, i);
-
-                    const int64_t t1 = (t_last - t_start).count()/1000000;
-                    const int64_t t0 = std::max(0.0, t1 - pcmf32.size()*1000.0/WHISPER_SAMPLE_RATE);
-
-                    std::string srt = format_segment_srt((int) n_iter / n_new_line, t0/10, t1/10, text);
-                    if (!udp.send(srt)) {
-                        fprintf(stderr, "%s: warning: failed to send UDP packet\n", __func__);
-                    }
-                }
-            }
 
             if (!use_vad && (n_iter % n_new_line) == 0) {
                 printf("\n");
