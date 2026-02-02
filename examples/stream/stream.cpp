@@ -51,6 +51,7 @@ struct whisper_params {
     std::string fname_out;
 
     // Enhanced features
+    int32_t keep_tokens        = 0;      // max number of tokens to keep from context (0 = unlimited)
     int32_t vad_startup_ms     = 0;      // initial VAD check duration before loading model (0 = disabled)
     int32_t silence_timeout_ms = 180000; // continual silence timeout (0 = disabled)
     int32_t udp_port           = 0;      // UDP port for network output (0 = disabled)
@@ -164,6 +165,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
         // Enhanced features
+        else if (arg == "-kt"   || arg == "--keep-tokens")   { params.keep_tokens       = std::stoi(argv[++i]); }
         else if (arg == "-vsu"  || arg == "--vad-startup")   { params.vad_startup_ms    = std::stoi(argv[++i]); }
         else if (arg == "-sto"  || arg == "--silence-timeout") { params.silence_timeout_ms = std::stoi(argv[++i]); }
         else if (arg == "-up"   || arg == "--udp-port")      { params.udp_port          = std::stoi(argv[++i]); }
@@ -199,6 +201,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -nf,      --no-fallback   [%-7s] do not use temperature fallback while decoding\n", params.no_fallback ? "true" : "false");
     fprintf(stderr, "  -ps,      --print-special [%-7s] print special tokens\n",                           params.print_special ? "true" : "false");
     fprintf(stderr, "  -kc,      --keep-context  [%-7s] keep context between audio chunks\n",              params.no_context ? "false" : "true");
+    fprintf(stderr, "  -kt N,    --keep-tokens N [%-7d] max number of tokens to keep from context (0 = unlimited)\n", params.keep_tokens);
     fprintf(stderr, "  -l LANG,  --language LANG [%-7s] spoken language\n",                                params.language.c_str());
     fprintf(stderr, "  -m FNAME, --model FNAME   [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME, --file FNAME    [%-7s] text output file name\n",                          params.fname_out.c_str());
@@ -593,13 +596,24 @@ int main(int argc, char ** argv) {
                 pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
 
                 // Add tokens of the last full length segment as the prompt
-                if (!params.no_context) {
+                if (!params.no_context || params.keep_tokens > 0) {
                     prompt_tokens.clear();
 
                     const int n_segments = whisper_full_n_segments(ctx);
                     for (int i = 0; i < n_segments; ++i) {
                         const int token_count = whisper_full_n_tokens(ctx, i);
-                        for (int j = 0; j < token_count; ++j) {
+
+                        // Determine how many tokens to keep and where to start
+                        int tokens_to_collect = token_count;
+                        int start_token_idx = 0;
+
+                        if (params.keep_tokens > 0) {
+                            // Take the last N tokens from this segment
+                            tokens_to_collect = std::min(params.keep_tokens, token_count);
+                            start_token_idx = token_count - tokens_to_collect;
+                        }
+
+                        for (int j = start_token_idx; j < start_token_idx + tokens_to_collect; ++j) {
                             prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
                         }
                     }
