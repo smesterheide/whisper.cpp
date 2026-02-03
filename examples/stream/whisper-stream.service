@@ -6,14 +6,17 @@ After=default.target
 Type=simple
 ExecStart=/home/sandro/whisper.cpp/build/bin/whisper-stream \
     -m /home/sandro/whisper.cpp/models/ggml-base.bin \
+    --threads 4 \
     --step 2000 \
-    --length 8000 \
+    --length 6000 \
     --audio-ctx 512 \
     --language es \
     --vad-startup 10000 \
     --silence-timeout 180000 \
     --udp-host 192.168.40.20 \
-    --udp-port 5555
+    --udp-port 5555 \
+    --keep-tokens 224 \
+    --no-fallback
 
 # Restart policy
 # whisper-stream exits cleanly when no voice detected or after silence timeout
